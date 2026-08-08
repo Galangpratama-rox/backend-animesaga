@@ -1,0 +1,12 @@
+{
+  "ignore": ["node_modules/", "dist/", ".git/"],
+  "rules": {
+    "no-var": "error",
+    "prefer-const": "error",
+    "no-console": "off",
+    "eqeqeq": ["error", "always"],
+    "semi": ["error", "always"],
+    "quotes": ["error", "double"],
+    "no-unused-vars": ["error", { "argsIgnorePattern": "^_" }]
+  }
+}

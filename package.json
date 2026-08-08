@@ -1,0 +1,25 @@
+{
+  "name": "anime-saga-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Anime Saga — leveling & XP management",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.1",
+    "helmet": "^7.1.0",
+    "multer": "^2.0.1",
+    "protobufjs": "^7.6.5",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "eslint": "^8.52.0"
+  }
+}
