@@ -7,6 +7,7 @@ import path from "path";
 
 import levelingRoutes from "./routes/leveling.js";
 import uploadRoutes from "./routes/upload.js";
+import proxyRoutes from "./routes/proxy.js";
 import { rateLimiter } from "./middleware/rateLimit.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { requireApiKey } from "./middleware/apiKey.js";
@@ -24,6 +25,8 @@ const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 // Middleware
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }, // izinkan load gambar dari frontend
+  contentSecurityPolicy: false, // disable CSP dari helmet (kita handle manual di proxy)
+  frameguard: false, // disable X-Frame-Options untuk allow iframe embedding
 }));
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(",") || ["http://localhost:5173"],
@@ -39,6 +42,7 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 // Routes
 app.use("/api/leveling", levelingRoutes);
 app.use("/api/upload", uploadRoutes);
+app.use("/api/proxy", proxyRoutes);
 
 // Health check
 app.get("/health", (_req, res) => {

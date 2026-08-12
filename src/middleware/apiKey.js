@@ -9,8 +9,12 @@
  *   - GET /uploads/* — tidak perlu key (static file publik)
  */
 export function requireApiKey(req, res, next) {
-  // Skip untuk health check dan static uploads
-  if (req.path === "/health" || req.path.startsWith("/uploads/")) {
+  // Skip untuk health check, static uploads, dan video proxy (browser tidak bisa kirim custom header)
+  if (
+    req.path === "/health" ||
+    req.path.startsWith("/uploads/") ||
+    req.path.startsWith("/api/proxy/video")
+  ) {
     return next();
   }
 
