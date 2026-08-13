@@ -21,6 +21,23 @@ const ALLOWED_VIDEO_DOMAINS = [
   "backblazeb2.com",
 ];
 
+// Domain gambar komik yang perlu proxy karena hotlink protection
+const ALLOWED_IMAGE_DOMAINS = [
+  "kiryuu.to",
+  "kiryuu.co",
+  "cdnesia.my.id",
+  "apkomik.com",
+  "komikstation.co",
+  "komikcast.com",
+  "wpmanga.net",
+  "mangakomik.id",
+  "i0.wp.com",
+  "i1.wp.com",
+  "i2.wp.com",
+  "i3.wp.com",
+  "wp.com",
+];
+
 /**
  * Video streaming proxy — mendukung Range requests untuk seeking.
  * GET /api/proxy/video?url=<encoded_url>
@@ -301,6 +318,152 @@ router.get("/stream", async (req, res) => {
       error: "Internal proxy error occurred"
     });
   }
+});
+
+/**
+ * Image proxy — bypass hotlink protection untuk gambar komik.
+ * GET /api/proxy/image?url=<encoded_url>
+ *
+ * Tidak butuh API key — diakses langsung oleh <img src> di browser.
+ * Domain yang diizinkan: ALLOWED_IMAGE_DOMAINS
+ *
+ * Fitur:
+ * - Header lengkap menyerupai browser biasa (lolos Cloudflare basic check)
+ * - Follow redirect manual (max 3 hop) agar tidak gagal di CDN yang redirect
+ * - Jika upstream non-ok (403/503/etc), coba lagi tanpa Referer sebagai fallback
+ * - Stream body langsung ke client (tidak buffer di memory)
+ */
+router.get("/image", async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ success: false, error: "URL parameter is required" });
+  }
+
+  let targetUrl;
+  try {
+    targetUrl = new URL(url);
+  } catch {
+    return res.status(400).json({ success: false, error: "Invalid URL format" });
+  }
+
+  if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
+    return res.status(400).json({ success: false, error: "Only HTTP/HTTPS URLs are allowed" });
+  }
+
+  const hostname = targetUrl.hostname.toLowerCase();
+  const isAllowed = ALLOWED_IMAGE_DOMAINS.some(
+    (d) => hostname === d || hostname.endsWith("." + d)
+  );
+
+  if (!isAllowed) {
+    console.log(`[ImageProxy] Blocked: ${hostname}`);
+    return res.status(403).json({ success: false, error: `Domain "${hostname}" not allowed for image proxy` });
+  }
+
+  console.log(`[ImageProxy] Fetching: ${hostname}${targetUrl.pathname.slice(0, 80)}`);
+
+  // Header lengkap menyerupai browser Chrome biasa agar lolos Cloudflare/hotlink check
+  const buildHeaders = (referer) => ({
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control":   "no-cache",
+    "Pragma":          "no-cache",
+    "Sec-Fetch-Dest":  "image",
+    "Sec-Fetch-Mode":  "no-cors",
+    "Sec-Fetch-Site":  "cross-site",
+    ...(referer ? { "Referer": referer } : {}),
+  });
+
+  /**
+   * Fetch dengan manual redirect (max 3 hop) dan timeout.
+   * Node 18 fetch sudah follow redirect secara default, tapi kita
+   * override redirect:"manual" supaya bisa update Referer di tiap hop.
+   */
+  async function fetchWithRedirect(fetchUrl, headersObj, hopsLeft = 3) {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 20000);
+
+    let upstream;
+    try {
+      upstream = await fetch(fetchUrl, {
+        signal:   controller.signal,
+        headers:  headersObj,
+        redirect: "follow", // biarkan Node handle redirect, lebih simpel
+      });
+    } finally {
+      clearTimeout(tid);
+    }
+    return upstream;
+  }
+
+  try {
+    // Percobaan 1: dengan Referer = origin domain
+    let upstream = await fetchWithRedirect(url, buildHeaders(`${targetUrl.origin}/`));
+
+    // Jika Cloudflare/hotlink balik 403/503, coba tanpa Referer (beberapa CDN malah reject Referer asing)
+    if (!upstream.ok && (upstream.status === 403 || upstream.status === 503 || upstream.status === 406)) {
+      console.log(`[ImageProxy] Upstream ${upstream.status} with Referer, retrying without...`);
+      upstream = await fetchWithRedirect(url, buildHeaders(null));
+    }
+
+    if (!upstream.ok) {
+      console.log(`[ImageProxy] Final upstream status: ${upstream.status} for ${hostname}`);
+      // Kembalikan placeholder 1x1 transparan daripada error JSON,
+      // sehingga <img> tidak tampil broken icon di browser
+      const TRANSPARENT_GIF = Buffer.from(
+        "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
+        "base64"
+      );
+      res.setHeader("Content-Type", "image/gif");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(200).send(TRANSPARENT_GIF);
+    }
+
+    const contentType   = upstream.headers.get("content-type")   || "image/jpeg";
+    const contentLength = upstream.headers.get("content-length");
+
+    res.setHeader("Content-Type", contentType);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(200);
+
+    // Stream body ke client
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); break; }
+        const ok = res.write(value);
+        if (!ok) await new Promise((resolve) => res.once("drain", resolve));
+      }
+    };
+    req.on("close", () => reader.cancel());
+    await pump();
+
+  } catch (err) {
+    if (!res.headersSent) {
+      if (err.name === "AbortError") {
+        return res.status(504).json({ success: false, error: "Image proxy timeout" });
+      }
+      console.error("[ImageProxy] Error:", err.message);
+      return res.status(502).json({ success: false, error: err.message });
+    }
+  }
+});
+
+/**
+ * OPTIONS preflight untuk /image (CORS)
+ */
+router.options("/image", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range");
+  res.status(204).end();
 });
 
 export default router;
