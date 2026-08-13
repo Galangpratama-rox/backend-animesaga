@@ -29,11 +29,26 @@ app.use(helmet({
   frameguard: false, // disable X-Frame-Options untuk allow iframe embedding
 }));
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(",") || ["http://localhost:5173"],
-  credentials: true
+  origin: (origin, callback) => {
+    const allowed = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
+      .split(",")
+      .map((o) => o.trim());
+    // Izinkan request tanpa origin (server-to-server, curl, dsb)
+    if (!origin || allowed.includes(origin) || allowed.includes("*")) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
 }));
 app.use(express.json({ limit: "10kb" }));
 app.use(rateLimiter);
+
+// ── Public routes (tidak perlu API key) ───────────────────────────────────
+// Proxy image/video diakses langsung oleh browser via <img src> dan <video src>
+// sehingga tidak bisa menyertakan header X-API-Key
+app.use("/api/proxy", proxyRoutes);
+
 app.use(requireApiKey); // blok request tanpa API key yang valid
 
 // ── Static file serving untuk uploads ─────────────────────────────────────
@@ -42,7 +57,6 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 // Routes
 app.use("/api/leveling", levelingRoutes);
 app.use("/api/upload", uploadRoutes);
-app.use("/api/proxy", proxyRoutes);
 
 // Health check
 app.get("/health", (_req, res) => {

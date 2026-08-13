@@ -9,12 +9,14 @@
  *   - GET /uploads/* — tidak perlu key (static file publik)
  */
 export function requireApiKey(req, res, next) {
-  // Skip untuk health check, static uploads, dan video/image proxy (browser tidak bisa kirim custom header)
+  const fullPath = req.originalUrl || req.path;
+
+  // Skip untuk health check, static uploads, dan proxy publik (browser tidak bisa kirim custom header)
   if (
     req.path === "/health" ||
-    req.path.startsWith("/uploads/") ||
-    req.path.startsWith("/api/proxy/video") ||
-    req.path.startsWith("/api/proxy/image")
+    fullPath.startsWith("/uploads/") ||
+    fullPath.startsWith("/api/proxy/video") ||
+    fullPath.startsWith("/api/proxy/image")
   ) {
     return next();
   }
