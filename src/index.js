@@ -34,9 +34,11 @@ app.use(cors({
       .split(",")
       .map((o) => o.trim());
     // Izinkan request tanpa origin (server-to-server, curl, dsb)
-    if (!origin || allowed.includes(origin) || allowed.includes("*")) {
-      return callback(null, true);
-    }
+    if (!origin) return callback(null, true);
+    // Exact match atau wildcard *
+    if (allowed.includes("*") || allowed.includes(origin)) return callback(null, true);
+    // Izinkan semua subdomain *.vercel.app untuk Vercel preview deployments
+    if (origin.endsWith(".vercel.app")) return callback(null, true);
     return callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials: true,

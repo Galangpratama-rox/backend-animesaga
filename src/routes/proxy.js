@@ -1,6 +1,12 @@
 import express from "express";
+import https from "https";
+import http from "http";
 
 const router = express.Router();
+
+// Agent khusus untuk image proxy: skip SSL cert validation
+// (banyak CDN komik pakai cert expired/self-signed)
+const httpsAgentNoVerify = new https.Agent({ rejectUnauthorized: false });
 
 // Allowed streaming server domains for security
 const ALLOWED_DOMAINS = [
@@ -364,96 +370,130 @@ router.get("/image", async (req, res) => {
   console.log(`[ImageProxy] Fetching: ${hostname}${targetUrl.pathname.slice(0, 80)}`);
 
   // Header lengkap menyerupai browser Chrome biasa agar lolos Cloudflare/hotlink check
-  const buildHeaders = (referer) => ({
+  const buildImgHeaders = (referer) => ({
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control":   "no-cache",
-    "Pragma":          "no-cache",
     "Sec-Fetch-Dest":  "image",
     "Sec-Fetch-Mode":  "no-cors",
-    "Sec-Fetch-Site":  "cross-site",
-    ...(referer ? { "Referer": referer } : {}),
+    "Sec-Fetch-Site":  "same-site",
+    ...(referer ? { "Referer": referer, "Origin": referer.replace(/\/$/, "") } : {}),
   });
 
+  // Referer map: root domain → referer yang diterima CDN tersebut
+  const REFERER_MAP = {
+    "kiryuu.to":      "https://kiryuu.to/",
+    "kiryuu.co":      "https://kiryuu.co/",
+    "apkomik.com":    "https://apkomik.com/",
+    "komiknesia.com": "https://komiknesia.com/",
+    "cdnesia.my.id":  "https://komiknesia.com/",
+    "komikstation.co":"https://komikstation.co/",
+    "komikcast.com":  "https://komikcast.com/",
+    "wpmanga.net":    "https://wpmanga.net/",
+    "mangakomik.id":  "https://mangakomik.id/",
+    "wp.com":         "https://wordpress.com/",
+    "i0.wp.com":      "https://wordpress.com/",
+    "i1.wp.com":      "https://wordpress.com/",
+    "i2.wp.com":      "https://wordpress.com/",
+    "i3.wp.com":      "https://wordpress.com/",
+  };
+
+  function getReferer(hostname) {
+    const h = hostname.toLowerCase();
+    if (REFERER_MAP[h]) return REFERER_MAP[h];
+    for (const [domain, ref] of Object.entries(REFERER_MAP)) {
+      if (h === domain || h.endsWith(`.${domain}`)) return ref;
+    }
+    return `https://${h}/`;
+  }
+
   /**
-   * Fetch dengan manual redirect (max 3 hop) dan timeout.
-   * Node 18 fetch sudah follow redirect secara default, tapi kita
-   * override redirect:"manual" supaya bisa update Referer di tiap hop.
+   * Fetch gambar dengan https module (bukan native fetch) agar bisa
+   * skip SSL cert validation — CDN komik sering pakai cert expired.
+   * Follow redirect hingga maxHops kali.
    */
-  async function fetchWithRedirect(fetchUrl, headersObj, hopsLeft = 3) {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 20000);
+  function fetchImageWithRedirects(targetUrl, referer, onResponse, onError, hops = 0) {
+    if (hops > 5) { onError(new Error("Too many redirects")); return; }
 
-    let upstream;
-    try {
-      upstream = await fetch(fetchUrl, {
-        signal:   controller.signal,
-        headers:  headersObj,
-        redirect: "follow", // biarkan Node handle redirect, lebih simpel
-      });
-    } finally {
-      clearTimeout(tid);
-    }
-    return upstream;
-  }
-
-  try {
-    // Percobaan 1: dengan Referer = origin domain
-    let upstream = await fetchWithRedirect(url, buildHeaders(`${targetUrl.origin}/`));
-
-    // Jika Cloudflare/hotlink balik 403/503, coba tanpa Referer (beberapa CDN malah reject Referer asing)
-    if (!upstream.ok && (upstream.status === 403 || upstream.status === 503 || upstream.status === 406)) {
-      console.log(`[ImageProxy] Upstream ${upstream.status} with Referer, retrying without...`);
-      upstream = await fetchWithRedirect(url, buildHeaders(null));
-    }
-
-    if (!upstream.ok) {
-      console.log(`[ImageProxy] Final upstream status: ${upstream.status} for ${hostname}`);
-      // Kembalikan placeholder 1x1 transparan daripada error JSON,
-      // sehingga <img> tidak tampil broken icon di browser
-      const TRANSPARENT_GIF = Buffer.from(
-        "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
-        "base64"
-      );
-      res.setHeader("Content-Type", "image/gif");
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(200).send(TRANSPARENT_GIF);
-    }
-
-    const contentType   = upstream.headers.get("content-type")   || "image/jpeg";
-    const contentLength = upstream.headers.get("content-length");
-
-    res.setHeader("Content-Type", contentType);
-    if (contentLength) res.setHeader("Content-Length", contentLength);
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(200);
-
-    // Stream body ke client
-    const reader = upstream.body.getReader();
-    const pump = async () => {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) { res.end(); break; }
-        const ok = res.write(value);
-        if (!ok) await new Promise((resolve) => res.once("drain", resolve));
-      }
+    const isHttps = targetUrl.protocol === "https:";
+    const lib     = isHttps ? https : http;
+    const options = {
+      hostname: targetUrl.hostname,
+      port:     targetUrl.port || (isHttps ? 443 : 80),
+      path:     targetUrl.pathname + targetUrl.search,
+      method:   "GET",
+      headers:  buildImgHeaders(referer),
+      // Skip SSL validation — cert expired/self-signed pada banyak CDN komik
+      rejectUnauthorized: false,
     };
-    req.on("close", () => reader.cancel());
-    await pump();
 
-  } catch (err) {
-    if (!res.headersSent) {
-      if (err.name === "AbortError") {
-        return res.status(504).json({ success: false, error: "Image proxy timeout" });
+    const proxyReq = lib.request(options, (proxyRes) => {
+      const status   = proxyRes.statusCode || 0;
+      const location = proxyRes.headers["location"];
+
+      if ((status === 301 || status === 302 || status === 307 || status === 308) && location) {
+        proxyRes.resume(); // drain body
+        let nextUrl;
+        try { nextUrl = new URL(location, targetUrl.href); }
+        catch { onError(new Error(`Bad redirect: ${location}`)); return; }
+        fetchImageWithRedirects(nextUrl, getReferer(nextUrl.hostname), onResponse, onError, hops + 1);
+        return;
       }
-      console.error("[ImageProxy] Error:", err.message);
-      return res.status(502).json({ success: false, error: err.message });
-    }
+      onResponse(proxyRes, status);
+    });
+
+    proxyReq.on("error", onError);
+    proxyReq.setTimeout(20000, () => {
+      proxyReq.destroy();
+      onError(new Error("Proxy timeout"));
+    });
+    proxyReq.end();
   }
+
+  const referer = getReferer(hostname);
+
+  new Promise((resolve) => {
+    fetchImageWithRedirects(
+      targetUrl,
+      referer,
+      (proxyRes, status) => {
+        if (status < 200 || status >= 300) {
+          console.log(`[ImageProxy] Upstream ${status} for ${hostname}`);
+          // Kembalikan 1x1 transparan agar <img> tidak broken
+          const TRANSPARENT_GIF = Buffer.from(
+            "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
+            "base64"
+          );
+          res.setHeader("Content-Type", "image/gif");
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.status(200).send(TRANSPARENT_GIF);
+          resolve();
+          return;
+        }
+
+        const contentType   = proxyRes.headers["content-type"] || "image/jpeg";
+        const contentLength = proxyRes.headers["content-length"];
+
+        res.setHeader("Content-Type", contentType);
+        if (contentLength) res.setHeader("Content-Length", contentLength);
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.status(200);
+
+        proxyRes.pipe(res);
+        proxyRes.on("end", resolve);
+        proxyRes.on("error", resolve);
+        req.on("close", () => proxyRes.destroy());
+      },
+      (err) => {
+        console.error("[ImageProxy] Error:", err.message);
+        if (!res.headersSent) res.status(502).json({ success: false, error: err.message });
+        resolve();
+      }
+    );
+  });
 });
 
 /**
