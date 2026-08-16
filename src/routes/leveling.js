@@ -208,13 +208,17 @@ router.get("/user/:uid/full-profile", async (req, res) => {
       history = histSnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
     }
 
+    // Hanya kembalikan email kalau viewer adalah diri sendiri
+    const isSelf = viewer_uid === uid;
+
     res.json({
       success: true,
       uid,
       displayName:      userData.displayName || "User",
       photoURL:         userData.photoURL    || "",
       bannerURL:        userData.bannerURL   || "",
-      email:            userData.email       || "",
+      // email TIDAK dikirim ke viewer lain — privacy protection
+      ...(isSelf ? { email: userData.email || "" } : {}),
       xp,
       level,
       badge:            getLevelBadge(level),
