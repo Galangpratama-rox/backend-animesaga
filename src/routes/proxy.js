@@ -32,6 +32,9 @@ const httpKeepAliveAgent = new http.Agent({
 const ALLOWED_DOMAINS = ["desustream.net", "ondesuhd.com", "ondesuhd.net"];
 
 // Allowed video CDN domains for video proxy
+// Jika byDomain TIDAK lolos, backend MASIH mengijinkan byExt (mp4/webm/mkv/m3u8/ts).
+// List ini adalah WHITELIST EXTRA untuk domain yang URL-nya TIDAK berakhir dengan
+// ext standard (contoh: redirect m3u8 tanpa ext, atau URL aneh dari admin page).
 const ALLOWED_VIDEO_DOMAINS = [
   "r2.cloudflarestorage.com",
   "kuramadrive.com",
@@ -44,6 +47,22 @@ const ALLOWED_VIDEO_DOMAINS = [
   "storage.googleapis.com",
   "b-cdn.net",
   "backblazeb2.com",
+  // === URL CUSTOM ADMIN PAGE (user menambahkan episode baru bukan dari kuramanime/otakudesu) ===
+  // Contoh user: https://cdn-203.lancartech.co.id/_UPLOAD_BARU_/.../....mp4
+  "lancartech.co.id",
+  // === Generic CDN populer yang sering user pakai upload video manual ===
+  "cloudflare.net",
+  "workers.dev",
+  "cdn.discordapp.com",
+  "media.discordapp.net",
+  "dropbox.com",
+  "dl.dropboxusercontent.com",
+  "mega.nz",
+  "pixeldrain.com",
+  "streamtape.com",
+  "streamcherry.com",
+  "filemoon.sx",
+  "luluvdo.com",
 ];
 
 // ── Referer/Origin Spoofing Map per domain group ──
