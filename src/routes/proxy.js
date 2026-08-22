@@ -63,6 +63,8 @@ const ALLOWED_VIDEO_DOMAINS = [
   "streamcherry.com",
   "filemoon.sx",
   "luluvdo.com",
+  // === HLS Custom Domain ===
+  "xtwap.top",
 ];
 
 // ── Referer/Origin Spoofing Map per domain group ──
@@ -111,6 +113,80 @@ function getSpoofedHeadersForVideo(hostname) {
   };
 }
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HLS SESSION TRACKER (In-Memory, no dependency)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * MASALAH: Browser `strict-origin-when-cross-origin` memblokir Referer
+ *          header full URL pada cross-origin request (localhost:5173 → 3001).
+ *          Safety net sebelumnya bergantung Referer full URL untuk
+ *          mereconstruct base directory m3u8 → GAGAL.
+ *
+ * SOLUSI: Track mapping (clientIP → last m3u8 baseDir) di memory.
+ *         Setiap kali m3u8 di-request via /video, SIMPAN mapping ini.
+ *         Safety net pertama-tama coba lookup dari session tracker ini
+ *         (TIDAK bergantung Referer). Baru fallback ke Referer + manual parse.
+ *
+ * CLEANUP: Max 200 entry (LRU sederhana via Map insertion order). Entri >30 menit
+ *          otomatis dihapus tiap ada request baru untuk hemat memory.
+ */
+const HLSSessionMap = new Map(); // key = clientIP, value = { baseDirHref, ts }
+const HLS_SESSION_TTL_MS = 30 * 60 * 1000; // 30 menit
+
+function _cleanupHLSSessions() {
+  const now = Date.now();
+  for (const [ip, entry] of HLSSessionMap.entries()) {
+    if (now - entry.ts > HLS_SESSION_TTL_MS) HLSSessionMap.delete(ip);
+  }
+  // LRU: batasi 200 entry (hapus paling tua = Map insertion order terawal)
+  if (HLSSessionMap.size > 200) {
+    const toDelete = HLSSessionMap.size - 200;
+    let i = 0;
+    for (const ip of HLSSessionMap.keys()) {
+      if (i >= toDelete) break;
+      HLSSessionMap.delete(ip);
+      i++;
+    }
+  }
+}
+
+function saveHLSSession(clientIP, baseDirHref) {
+  if (!clientIP || !baseDirHref) return;
+  _cleanupHLSSessions();
+  // Delete dulu agar insertion order jadi terbaru (LRU sederhana)
+  HLSSessionMap.delete(clientIP);
+  HLSSessionMap.set(clientIP, { baseDirHref, ts: Date.now() });
+}
+
+function getHLSSession(clientIP) {
+  _cleanupHLSSessions();
+  const entry = HLSSessionMap.get(clientIP);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > HLS_SESSION_TTL_MS) {
+    HLSSessionMap.delete(clientIP);
+    return null;
+  }
+  return entry.baseDirHref;
+}
+
+/**
+ * Helper extract client real IP dari Express request (handle proxy / x-forwarded)
+ */
+function getClientIP(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (xf) {
+    const first = String(xf).split(",")[0].trim();
+    if (first) return first;
+  }
+  return (
+    req.ip ||
+    req.socket?.remoteAddress ||
+    req.connection?.remoteAddress ||
+    "unknown"
+  );
+}
+
 // Domain gambar komik yang perlu proxy karena hotlink protection
 const ALLOWED_IMAGE_DOMAINS = [
   "kiryuu.to",
@@ -142,6 +218,20 @@ const ALLOWED_IMAGE_DOMAINS = [
  */
 router.get("/video", (req, res) => {
   const { url } = req.query;
+  const clientIP = getClientIP(req);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // VERBOSE DEBUG LOG (wajib agar user tahu apakah route ini terpanggil)
+  // ═══════════════════════════════════════════════════════════════════════
+  const _dbgShortUrl = url
+    ? String(url).slice(0, 80) + (String(url).length > 80 ? "..." : "")
+    : "(MISSING)";
+  console.log(
+    "[VideoProxy] ➡️  INCOMING /video | ip=" +
+      clientIP +
+      " | url=" +
+      _dbgShortUrl,
+  );
 
   if (!url) {
     return res
@@ -176,6 +266,34 @@ router.get("/video", (req, res) => {
     return res
       .status(403)
       .json({ success: false, error: "Domain not allowed for video proxy" });
+  }
+
+  // ── PRE-LOG: Apakah ini m3u8? Harusnya rewrite jalan ────────────────
+  const isM3u8Before = ext === "m3u8";
+  console.log(
+    "[VideoProxy] 🧪 CLASSIFY: hostname=" +
+      hostname +
+      " | ext=" +
+      ext +
+      " | byDomain=" +
+      byDomain +
+      " | byExt=" +
+      byExt +
+      " | isM3u8=" +
+      isM3u8Before,
+  );
+  if (isM3u8Before) {
+    // Simpan session SEGERA sebelum fetch upstream, agar request .ts
+    // dari IP yang sama bisa di-track walaupun upstream fail
+    const origHref = targetUrl.href;
+    const baseDirHref = origHref.substring(0, origHref.lastIndexOf("/") + 1);
+    saveHLSSession(clientIP, baseDirHref);
+    console.log(
+      "[VideoProxy] 📝 HLS session saved: ip=" +
+        clientIP +
+        " → baseDir=" +
+        baseDirHref.slice(0, 100),
+    );
   }
 
   // === LOG DETAIL KURAMANIME / VIDEO PROXY ===
@@ -423,7 +541,123 @@ router.get("/video", (req, res) => {
       // Status: 206 Partial Content jika upstream reply range, else 200
       res.status(status === 206 ? 206 : 200);
 
-      // ── Pipe stream dengan back-pressure handling ──
+      // ═════════════════════════════════════════════════════════════════════════
+      // HLS M3U8 REWRITE v2 (AGRESIF): Khusus file .m3u8 — SELALU rewrite
+      // tanpa peduli status code upstream.
+      //
+      // Kenapa v2? Native <video> Safari/Chrome KADANG resolve relative URI
+      // terhadap PATHNAME SAJA (abaikan query ?url=...), jadi player request:
+      //     http://localhost:5173/api/proxy/seg_0.ts
+      // Padahal yang benar seharusnya lewat /api/proxy/video?url=...
+      //
+      // Solusi: Rewrite SEMUA segment URI ke absolute PROXY URL.
+      // ⚠️  HANYA berlaku untuk .m3u8 — ts/mp4/webm/mkv TETAP PIPE LANGSUNG.
+      // ═════════════════════════════════════════════════════════════════════════
+      const isM3u8 = ext === "m3u8";
+
+      if (isM3u8) {
+        const chunks = [];
+        proxyRes.on("data", (chunk) => chunks.push(chunk));
+        proxyRes.on("end", () => {
+          try {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            // Base directory dari m3u8 upstream (untuk resolve relative seg)
+            const origHref = targetUrl.href;
+            const baseDirHref = origHref.substring(
+              0,
+              origHref.lastIndexOf("/") + 1,
+            );
+            // ── Detect BACKEND host yang BENAR ────────────────────────────
+            // KALAU request datang dari Vite dev proxy (host = localhost:5173),
+            // JANGAN pakai host 5173! Nanti segment .ts dilempar ke Vite yang
+            // gak punya route → 404 "Endpoint not found".
+            // Force ke localhost:3001 (atau VITE_BACKEND_URL yang sesungguhan).
+            const reqHost =
+              req.headers["x-forwarded-host"] ||
+              req.headers.host ||
+              "localhost:3001";
+            const isViteProxy =
+              String(reqHost).includes("5173") ||
+              String(req.headers["via"] || "")
+                .toLowerCase()
+                .includes("vite");
+            // Gunakan ENV BACKEND_URL jika tersedia (lebih akurat untuk production)
+            const envBackend = (process.env.BACKEND_PUBLIC_URL || "").trim();
+            let realBackend;
+            if (envBackend) {
+              realBackend = envBackend.replace(/\/$/, "");
+            } else if (isViteProxy) {
+              realBackend = "http://localhost:3001";
+            } else {
+              const proto =
+                req.headers["x-forwarded-proto"] ||
+                (req.protocol ? req.protocol : "") ||
+                (req.socket && req.socket.encrypted ? "https" : "http") ||
+                "http";
+              realBackend = `${proto}://${reqHost}`;
+            }
+            const proxyPrefix = `${realBackend}/api/proxy/video?url=`;
+
+            // ── Rewrite segment URI ───────────────────────────────────────
+            const lines = raw.split(/\r?\n/);
+            let rewroteCount = 0;
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              if (!line || line.startsWith("#")) continue;
+              let segmentAbsUrl;
+              try {
+                segmentAbsUrl = new URL(line).href; // sudah absolute
+              } catch {
+                try {
+                  segmentAbsUrl = new URL(line, baseDirHref).href; // relative
+                } catch {
+                  continue;
+                }
+              }
+              lines[i] = proxyPrefix + encodeURIComponent(segmentAbsUrl);
+              rewroteCount++;
+            }
+
+            const rewritten = lines.join("\n");
+            res.setHeader(
+              "Content-Length",
+              Buffer.byteLength(rewritten, "utf8"),
+            );
+            res.setHeader(
+              "Content-Type",
+              "application/vnd.apple.mpegurl; charset=utf-8",
+            );
+            console.log(
+              "[VideoProxy] 🎞️  M3U8 v2: " +
+                hostname +
+                " | segRewrote=" +
+                rewroteCount +
+                " | reqHost=" +
+                reqHost +
+                " → realBackend=" +
+                realBackend,
+            );
+            res.end(rewritten);
+          } catch (rewriteErr) {
+            console.error(
+              "[VideoProxy] M3U8 Rewrite FAIL, fallback:",
+              rewriteErr.message,
+            );
+            if (!res.headersSent) {
+              res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+            }
+            res.end(Buffer.concat(chunks));
+          }
+        });
+        proxyRes.on("error", () => {
+          if (!res.headersSent) res.status(502).end();
+          else res.end();
+        });
+        return;
+      }
+
+      // ── Default: NON m3u8 (mp4 / webm / mkv / ts / range seek) →
+      //    PIPE streaming LANGSUNG — SAMA PERSIS TIDAK DIUBAH ──
       proxyRes.pipe(res);
 
       // Cleanup jika client disconnect sebelum upstream selesai
@@ -872,6 +1106,127 @@ router.options("/image", (req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Range");
   res.status(204).end();
+});
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║  FALLBACK ROUTE: HLS Relative Path Safety Net                           ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║                                                                          ║
+ * ║  MASALAH: Native <video> kadang resolve relative segment URI            ║
+ * ║           terhadap PATHNAME tanpa query string →                        ║
+ * ║           GET /api/proxy/seg_0.ts (bukan /api/proxy/video?url=...)      ║
+ * ║           → 404 Endpoint not found di index.js.                         ║
+ * ║                                                                          ║
+ * ║  SOLUSI: Route ini TANGKAP SEMUA request /api/proxy/<apapun> yang       ║
+ * ║          tidak match route spesifik (video/stream/image).               ║
+ * ║          Jika path ber-ekstensi video/hls (.ts, .m3u8, .mp4, dll),      ║
+ * ║          reconstruct URL xtwap FULL dari Referer header request m3u8,   ║
+ *          lalu forward ke handler /video normal via internal redirect.    ║
+ * ║                                                                          ║
+ * ║  INI SAFETY NET TERAKHIR — hanya jalan kalau rewrite m3u8 gagal.        ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ */
+router.get("*", (req, res, next) => {
+  const rawPath = req.path; // misal: /seg_0.ts
+  const trimmed = rawPath.replace(/^\/+/, ""); // hilangkan leading slashes
+  const clientIP = getClientIP(req);
+  if (!trimmed) return next(); // root proxy path, skip
+
+  console.log(
+    "[VideoProxy] 🛟 SAFETY NET TRIGGERED: ip=" +
+      clientIP +
+      " | path=" +
+      rawPath +
+      " | query=" +
+      JSON.stringify(req.query).slice(0, 100),
+  );
+
+  // Hanya tangani ekstensi yang jelas-jelas media (jangan tangani random path)
+  const extMatch = trimmed.match(/\.([a-z0-9]{2,5})(?:\?|$)/i);
+  const ext = extMatch ? extMatch[1].toLowerCase() : "";
+  const isMediaExt = [
+    "ts",
+    "m3u8",
+    "m4s",
+    "mp4",
+    "webm",
+    "mkv",
+    "mov",
+    "aac",
+    "mp3",
+  ].includes(ext);
+  if (!isMediaExt) {
+    return next();
+  }
+
+  // ── PRIORITAS #1: Cek HLS session tracker (BERBASIS CLIENT IP) ─────────
+  //    Inilah yang menyelamatkan dari Referer header diblokir CORS!
+  let baseDirHref = getHLSSession(clientIP);
+  let fromSession = !!baseDirHref;
+
+  // ── PRIORITAS #2: Referer header (hanya sebagai fallback) ──────────────
+  if (!baseDirHref) {
+    const referer = req.headers.referer || req.headers.referrer || "";
+    try {
+      const refUrl = new URL(referer);
+      const encodedOrig = refUrl.searchParams.get("url");
+      if (encodedOrig) {
+        const origM3u8 = new URL(decodeURIComponent(encodedOrig));
+        baseDirHref = origM3u8.href.substring(
+          0,
+          origM3u8.href.lastIndexOf("/") + 1,
+        );
+      }
+    } catch {
+      /* abaikan */
+    }
+  }
+
+  if (baseDirHref) {
+    try {
+      const segFullUrl = new URL(trimmed, baseDirHref).href;
+      console.log(
+        "[VideoProxy] 🛟 SAFETY NET RESOLVED: fromSession=" +
+          fromSession +
+          " | " +
+          rawPath +
+          " → " +
+          segFullUrl.substring(0, 120),
+      );
+      const nextReq = {
+        ...req,
+        query: { ...req.query, url: segFullUrl },
+      };
+      const videoHandler = router.stack.find(
+        (l) =>
+          l.route &&
+          l.route.path === "/video" &&
+          l.route.methods &&
+          l.route.methods.get,
+      );
+      if (videoHandler) return videoHandler.handle(nextReq, res, () => {});
+    } catch (e) {
+      console.error("[VideoProxy] Safety net reconstruct fail:", e.message);
+    }
+  }
+
+  // Fallback: tidak bisa reconstruct
+  const sessMapSize = HLSSessionMap.size;
+  res.status(400).json({
+    success: false,
+    error:
+      "[HLS Safety Net] Tidak bisa menemukan session HLS. " +
+      "src=" +
+      rawPath +
+      " | clientIP=" +
+      clientIP +
+      " | sessionMapSize=" +
+      sessMapSize +
+      " | fromSessionTried=" +
+      fromSession +
+      ". PASTIKAN request m3u8 via /api/proxy/video?url=... DIJALANKAN DULU sebelum request segment!",
+  });
 });
 
 export default router;
